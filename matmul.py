@@ -15,6 +15,8 @@ def mul_kernel(
   stride_ak: tl.constexpr,
   stride_bk: tl.constexpr,
   stride_bn: tl.constexpr,
+  stride_cm: tl.constexpr,
+  stride_cn: tl.constexpr,
   BLOCK_M: tl.constexpr,
   BLOCK_N: tl.constexpr,
   BLOCK_K: tl.constexpr,
@@ -28,12 +30,16 @@ def mul_kernel(
   acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
 
   for k in range(0, K, BLOCK_K):
-    a = tl.load(A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b = tl.load(B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-    acc += tl.dot(a, b)
     offs_k = k + tl.arange(0, BLOCK_K)
+    mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+    mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
+    a = tl.load(A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak, mask=mask_a, other=0.0)
+    b = tl.load(B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn, mask=mask_b, other=0.0)
+    
+    acc += tl.dot(a, b, input_precision="ieee")
   
-  tl.store(C + offs_m[:, None] * stride_am + offs_n[None, :] * stride_bn, acc)
+  mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+  tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc, mask=mask_c)
 
 def mul(x: torch.Tensor, y: torch.Tensor):
   M, K = x.shape
@@ -43,24 +49,28 @@ def mul(x: torch.Tensor, y: torch.Tensor):
   stride_bk = y.stride(0)
   stride_bn = y.stride(1)
   
-  w = torch.empty([M, N], device="cuda")
+  w = torch.empty([M, N], device="cuda", dtype=torch.float32)
+  stride_cm = w.stride(0)
+  stride_cn = w.stride(1)
   
   grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]), triton.cdiv(N, META["BLOCK_N"]))
   mul_kernel[grid](
     x,y,w,
     M,N,K,
     stride_am, stride_ak, stride_bk, stride_bn,
-    BLOCK_M=256, BLOCK_N=256, BLOCK_K=256
+    stride_cm, stride_cn,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32
   )
   
   return w
 
 def main():
   M = 1024
-  N = 2048
-  K = 4096
-  x = torch.randn([M, K], device='cuda')
-  y = torch.randn([K, N], device='cuda')
+  N = 256
+  K = 512
+  torch.manual_seed(42)
+  x = torch.randn([M, K], device='cuda', dtype=torch.float32)
+  y = torch.randn([K, N], device='cuda', dtype=torch.float32)
   
   output_torch = x @ y
   output_triton = mul(x, y)
